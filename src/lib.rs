@@ -1,8 +1,8 @@
 #![warn(clippy::pedantic)]
 mod chacha;
 mod poly1305;
-use chacha::block;
 pub use chacha::chacha20;
+use chacha::chacha20_block;
 use poly1305::poly1305;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 type Key = [u8; 32];
@@ -21,7 +21,7 @@ impl Poly1305Key {
     /// It can't unless an Invariant fails
     fn key_gen(key: Key, nonce: Nonce) -> Result<Self, Error> {
         Ok(Self(
-            block(key, nonce, 0)?[0..32]
+            chacha20_block(key, nonce, 0)?[0..32]
                 .try_into()
                 .map_err(|_| Error::OhGodPleaseNo)?,
         ))
@@ -36,19 +36,44 @@ pub fn chacha20poly1305_encrypt(
     nonce: Nonce,
 ) -> Result<Vec<u8>, Error> {
     let aad = aad.unwrap_or(&[]);
-    let tag_key = Poly1305Key::key_gen(key, nonce)?;
     let ciphertext_raw = chacha20(key, nonce, None, plaintext)?;
     let mut ciphertext_aead = Vec::with_capacity(plaintext.len() + 16);
     ciphertext_aead.extend_from_slice(&ciphertext_raw);
+    ciphertext_aead.extend_from_slice(&aead_tag(aad, &ciphertext_raw, key, nonce)?);
+    Ok(ciphertext_aead)
+}
+/// # Errors
+/// The ciphertext is too short or fails authentication, or the universe is broken(Invariants Failed)
+pub fn chacha20poly1305_decrypt(
+    ciphertext: &[u8],
+    aad: Option<&[u8]>,
+    key: Key,
+    nonce: Nonce,
+) -> Result<Vec<u8>, Error> {
+    let aad = aad.unwrap_or(&[]);
+    let split = ciphertext.len().checked_sub(16).ok_or(Error::CryptoError)?;
+    let (ciphertext_raw, tag) = ciphertext.split_at(split);
+    let expected_tag = aead_tag(aad, ciphertext_raw, key, nonce)?;
+    // Constant time comparison, so we don't leak how many bytes of the tag matched
+    let diff = tag
+        .iter()
+        .zip(expected_tag.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    if std::hint::black_box(diff) != 0 {
+        return Err(Error::CryptoError);
+    }
+    chacha20(key, nonce, None, ciphertext_raw)
+}
+fn aead_tag(aad: &[u8], ciphertext: &[u8], key: Key, nonce: Nonce) -> Result<[u8; 16], Error> {
+    let tag_key = Poly1305Key::key_gen(key, nonce)?;
     let mut msg = Vec::new();
     msg.extend_from_slice(aad);
     msg.extend(std::iter::repeat_n(0, (16 - msg.len() % 16) % 16));
-    msg.extend_from_slice(&ciphertext_raw);
+    msg.extend_from_slice(ciphertext);
     msg.extend(std::iter::repeat_n(0, (16 - msg.len() % 16) % 16));
     msg.extend_from_slice(&(aad.len() as u64).to_le_bytes());
-    msg.extend_from_slice(&(ciphertext_raw.len() as u64).to_le_bytes());
-    ciphertext_aead.extend_from_slice(&poly1305(&tag_key, &msg)?);
-    Ok(ciphertext_aead)
+    msg.extend_from_slice(&(ciphertext.len() as u64).to_le_bytes());
+    poly1305(&tag_key, &msg)
 }
 #[cfg(test)]
 mod tests {
@@ -105,5 +130,39 @@ mod tests {
                 0xd0, 0x60, 0x06, 0x91,
             ]
         );
+    }
+    #[test]
+    fn chacha20poly1305_round_trip() {
+        let key = [0x42u8; 32];
+        let nonce = [0x24u8; 12];
+        let aad = b"some header";
+        for len in [0u8, 1, 15, 16, 17, 64, 65, 200] {
+            let plaintext: Vec<u8> = (0..len).collect();
+            let ciphertext = chacha20poly1305_encrypt(&plaintext, Some(aad), key, nonce).unwrap();
+            assert_eq!(ciphertext.len(), plaintext.len() + 16);
+            let decrypted = chacha20poly1305_decrypt(&ciphertext, Some(aad), key, nonce).unwrap();
+            assert_eq!(decrypted, plaintext);
+        }
+    }
+    #[test]
+    fn chacha20poly1305_rejects_tampering() {
+        let key = [0x42u8; 32];
+        let nonce = [0x24u8; 12];
+        let aad = b"some header";
+        let ciphertext =
+            chacha20poly1305_encrypt(b"attack at dawn", Some(aad), key, nonce).unwrap();
+        // Flipped bit in the ciphertext body
+        let mut tampered = ciphertext.clone();
+        tampered[0] ^= 1;
+        assert!(chacha20poly1305_decrypt(&tampered, Some(aad), key, nonce).is_err());
+        // Flipped bit in the tag
+        let mut tampered = ciphertext.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(chacha20poly1305_decrypt(&tampered, Some(aad), key, nonce).is_err());
+        // Wrong or missing AAD
+        assert!(chacha20poly1305_decrypt(&ciphertext, Some(b"other header"), key, nonce).is_err());
+        assert!(chacha20poly1305_decrypt(&ciphertext, None, key, nonce).is_err());
+        // Too short to even hold a tag
+        assert!(chacha20poly1305_decrypt(&ciphertext[..15], Some(aad), key, nonce).is_err());
     }
 }

@@ -64,7 +64,7 @@ fn block_adder(key: Key, nonce: Nonce, counter: u32) -> Result<State, Error> {
 }
 /// # Errors
 /// There are none lolol
-pub fn block(key: Key, nonce: Nonce, counter: u32) -> Result<Zeroizing<[u8; 64]>, Error> {
+pub fn chacha20_block(key: Key, nonce: Nonce, counter: u32) -> Result<Zeroizing<[u8; 64]>, Error> {
     let mut serialized = Zeroizing::new([0u8; 64]);
     for (i, val) in block_adder(key, nonce, counter)?.iter().enumerate() {
         serialized[i * 4..i * 4 + 4].copy_from_slice(&val.to_le_bytes());
@@ -84,23 +84,12 @@ pub fn chacha20(
         return Err(Error::CryptoError);
     }
     let mut ciphertext = Vec::with_capacity(plaintext.len());
-    for i in 0..(plaintext.len().div_ceil(64) - 1) {
+    for (i, plaintext_block) in plaintext.chunks(64).enumerate() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         // Shut the hell up clippy we already validated plaintext length
-        let key_stream = block(key, nonce, counter + i as u32)?;
-        let block = &plaintext[(i * 64)..(i * 64 + 64)];
-        for (i, byte) in key_stream.iter().enumerate() {
-            ciphertext.push(block[i] ^ *byte);
-        }
-    }
-    if !plaintext.len().is_multiple_of(64) {
-        let whole_block_count = plaintext.len().div_ceil(64) - 1;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        // Shut the hell up clippy we already validated plaintext length
-        let key_stream = block(key, nonce, counter + whole_block_count as u32)?;
-        let block = &plaintext[(whole_block_count * 64)..plaintext.len()];
-        for i in 0..plaintext.len() % 64 {
-            ciphertext.push(block[i] ^ key_stream[i]);
+        let key_stream = chacha20_block(key, nonce, counter + i as u32)?;
+        for (byte, key_byte) in plaintext_block.iter().zip(key_stream.iter()) {
+            ciphertext.push(byte ^ key_byte);
         }
     }
     Ok(ciphertext)
@@ -118,7 +107,7 @@ mod tests {
     #[test]
     fn block_test() {
         assert_eq!(
-            *block(
+            *chacha20_block(
                 [
                     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
                     0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
