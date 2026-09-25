@@ -1,0 +1,185 @@
+use std::iter::zip;
+
+use zeroize::Zeroizing;
+type Key = [u8; 32];
+type Nonce = [u8; 12];
+type State = Zeroizing<[u32; 16]>;
+const DEFAULT_INITIAL_COUNTER: u32 = 1;
+#[derive(Debug)]
+pub struct Error; // Security guy told me telling attackers why it failed is bad or something idk
+#[rustfmt::skip]
+fn quarter_round(a: u32, b: u32, c: u32, d: u32, state: &mut [u32]) {
+    let a = a as usize;
+    let b = b as usize;
+    let c = c as usize;
+    let d = d as usize;
+    {
+        state[a] = state[a].wrapping_add(state[b]); state[d] ^= state[a]; state[d] = state[d].rotate_left(16);
+        state[c] = state[c].wrapping_add(state[d]); state[b] ^= state[c]; state[b] = state[b].rotate_left(12);
+        state[a] = state[a].wrapping_add(state[b]); state[d] ^= state[a]; state[d] = state[d].rotate_left(8);
+        state[c] = state[c].wrapping_add(state[d]); state[b] ^= state[c]; state[b] = state[b].rotate_left(7);
+    }
+}
+#[rustfmt::skip]
+fn initialize_state(key: Key, nonce: Nonce, counter: u32) -> State {
+    let mut ikey = Zeroizing::new([0u32; 8]); // Intermediate key representation
+    for (i, val) in ikey.iter_mut().enumerate() {
+        *val = u32::from_le_bytes(
+            key[(i * 4)..(4 + (i * 4))]
+                .try_into()
+                .expect("Something has gone VERY, VERY wrong."),
+        );
+    }
+    let mut inonce = [0u32; 3]; // Intermediate nonce representation
+    for (i, val) in inonce.iter_mut().enumerate() {
+        *val = u32::from_le_bytes(
+            nonce[(i * 4)..(4 + (i * 4))]
+                .try_into()
+                .expect("Something has gone VERY, VERY wrong."),
+        );
+    }
+    Zeroizing::new([
+        0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574,
+        ikey[0], ikey[1], ikey[2], ikey[3],
+        ikey[4], ikey[5], ikey[6], ikey[7],
+        counter, inonce[0], inonce[1], inonce[2]
+    ])
+}
+fn inner_block(key: Key, nonce: Nonce, counter: u32) -> State {
+    let mut state = initialize_state(key, nonce, counter);
+    for _ in 0..10 {
+        quarter_round(0, 4, 8, 12, state.as_mut());
+        quarter_round(1, 5, 9, 13, state.as_mut());
+        quarter_round(2, 6, 10, 14, state.as_mut());
+        quarter_round(3, 7, 11, 15, state.as_mut());
+        quarter_round(0, 5, 10, 15, state.as_mut());
+        quarter_round(1, 6, 11, 12, state.as_mut());
+        quarter_round(2, 7, 8, 13, state.as_mut());
+        quarter_round(3, 4, 9, 14, state.as_mut());
+    }
+    state
+}
+fn block_adder(key: Key, nonce: Nonce, counter: u32) -> State {
+    let mut state = inner_block(key, nonce, counter);
+    let initial_state = initialize_state(key, nonce, counter);
+    for (init, processed) in zip(initial_state.iter(), state.iter_mut()) {
+        *processed = processed.wrapping_add(*init);
+    }
+    state
+}
+fn block(key: Key, nonce: Nonce, counter: u32) -> Zeroizing<[u8; 64]> {
+    let mut serialized = Zeroizing::new([0u8; 64]);
+    for (i, val) in block_adder(key, nonce, counter).iter().enumerate() {
+        serialized[i * 4..i * 4 + 4].copy_from_slice(&val.to_le_bytes());
+    }
+    serialized
+}
+/// # Errors
+/// Uh sometimes the plaintext is too long
+pub fn chacha20(
+    key: Key,
+    nonce: Nonce,
+    counter: Option<u32>,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let counter = counter.unwrap_or(DEFAULT_INITIAL_COUNTER);
+    if plaintext.len() > u32::MAX as usize {
+        return Err(Error);
+    }
+    let mut ciphertext = Vec::with_capacity(plaintext.len());
+    for i in 0..(plaintext.len().div_ceil(64) - 1) {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        // Shut the hell up clippy we already validated plaintext length
+        let key_stream = block(key, nonce, counter + i as u32);
+        let block = &plaintext[(i * 64)..(i * 64 + 64)];
+        for (i, byte) in key_stream.iter().enumerate() {
+            ciphertext.push(block[i] ^ *byte);
+        }
+    }
+    if !plaintext.len().is_multiple_of(64) {
+        let whole_block_count = plaintext.len().div_ceil(64) - 1;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        // Shut the hell up clippy we already validated plaintext length
+        let key_stream = block(key, nonce, counter + whole_block_count as u32);
+        let block = &plaintext[(whole_block_count * 64)..plaintext.len()];
+        for i in 0..plaintext.len() % 64 {
+            ciphertext.push(block[i] ^ key_stream[i]);
+        }
+    }
+    Ok(ciphertext)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qr_test() {
+        let mut state = [0x1111_1111, 0x0102_0304, 0x9b8d_6f43, 0x0123_4567];
+        quarter_round(0, 1, 2, 3, &mut state);
+        assert_eq!([0xea2a_92f4, 0xcb1c_f8ce, 0x4581_472e, 0x5881_c4bb], state);
+    }
+    #[test]
+    fn block_test() {
+        assert_eq!(
+            *block(
+                [
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+                    0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
+                    0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+                ],
+                [
+                    0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00
+                ],
+                1,
+            ),
+            [
+                0x10, 0xf1, 0xe7, 0xe4, 0xd1, 0x3b, 0x59, 0x15, 0x50, 0x0f, 0xdd, 0x1f, 0xa3, 0x20,
+                0x71, 0xc4, 0xc7, 0xd1, 0xf4, 0xc7, 0x33, 0xc0, 0x68, 0x03, 0x04, 0x22, 0xaa, 0x9a,
+                0xc3, 0xd4, 0x6c, 0x4e, 0xd2, 0x82, 0x64, 0x46, 0x07, 0x9f, 0xaa, 0x09, 0x14, 0xc2,
+                0xd7, 0x05, 0xd9, 0x8b, 0x02, 0xa2, 0xb5, 0x12, 0x9c, 0xd1, 0xde, 0x16, 0x4e, 0xb9,
+                0xcb, 0xd0, 0x83, 0xe8, 0xa2, 0x50, 0x3c, 0x4e
+            ],
+        );
+    }
+    #[test]
+    fn correctness_test() {
+        let plaintext = [
+            0x4c, 0x61, 0x64, 0x69, 0x65, 0x73, 0x20, 0x61, 0x6e, 0x64, 0x20, 0x47, 0x65, 0x6e,
+            0x74, 0x6c, 0x65, 0x6d, 0x65, 0x6e, 0x20, 0x6f, 0x66, 0x20, 0x74, 0x68, 0x65, 0x20,
+            0x63, 0x6c, 0x61, 0x73, 0x73, 0x20, 0x6f, 0x66, 0x20, 0x27, 0x39, 0x39, 0x3a, 0x20,
+            0x49, 0x66, 0x20, 0x49, 0x20, 0x63, 0x6f, 0x75, 0x6c, 0x64, 0x20, 0x6f, 0x66, 0x66,
+            0x65, 0x72, 0x20, 0x79, 0x6f, 0x75, 0x20, 0x6f, 0x6e, 0x6c, 0x79, 0x20, 0x6f, 0x6e,
+            0x65, 0x20, 0x74, 0x69, 0x70, 0x20, 0x66, 0x6f, 0x72, 0x20, 0x74, 0x68, 0x65, 0x20,
+            0x66, 0x75, 0x74, 0x75, 0x72, 0x65, 0x2c, 0x20, 0x73, 0x75, 0x6e, 0x73, 0x63, 0x72,
+            0x65, 0x65, 0x6e, 0x20, 0x77, 0x6f, 0x75, 0x6c, 0x64, 0x20, 0x62, 0x65, 0x20, 0x69,
+            0x74, 0x2e,
+        ];
+        let ciphertext = vec![
+            0x6e, 0x2e, 0x35, 0x9a, 0x25, 0x68, 0xf9, 0x80, 0x41, 0xba, 0x07, 0x28, 0xdd, 0x0d,
+            0x69, 0x81, 0xe9, 0x7e, 0x7a, 0xec, 0x1d, 0x43, 0x60, 0xc2, 0x0a, 0x27, 0xaf, 0xcc,
+            0xfd, 0x9f, 0xae, 0x0b, 0xf9, 0x1b, 0x65, 0xc5, 0x52, 0x47, 0x33, 0xab, 0x8f, 0x59,
+            0x3d, 0xab, 0xcd, 0x62, 0xb3, 0x57, 0x16, 0x39, 0xd6, 0x24, 0xe6, 0x51, 0x52, 0xab,
+            0x8f, 0x53, 0x0c, 0x35, 0x9f, 0x08, 0x61, 0xd8, 0x07, 0xca, 0x0d, 0xbf, 0x50, 0x0d,
+            0x6a, 0x61, 0x56, 0xa3, 0x8e, 0x08, 0x8a, 0x22, 0xb6, 0x5e, 0x52, 0xbc, 0x51, 0x4d,
+            0x16, 0xcc, 0xf8, 0x06, 0x81, 0x8c, 0xe9, 0x1a, 0xb7, 0x79, 0x37, 0x36, 0x5a, 0xf9,
+            0x0b, 0xbf, 0x74, 0xa3, 0x5b, 0xe6, 0xb4, 0x0b, 0x8e, 0xed, 0xf2, 0x78, 0x5e, 0x42,
+            0x87, 0x4d,
+        ];
+        assert_eq!(
+            chacha20(
+                [
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+                    0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
+                    0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+                ],
+                [
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00
+                ],
+                None,
+                &plaintext
+            )
+            .unwrap(),
+            ciphertext
+        );
+    }
+}
