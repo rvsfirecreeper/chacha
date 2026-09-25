@@ -1,12 +1,8 @@
+use super::Error;
+use super::{Key, Nonce, State};
 use std::iter::zip;
-
 use zeroize::Zeroizing;
-type Key = [u8; 32];
-type Nonce = [u8; 12];
-type State = Zeroizing<[u32; 16]>;
 const DEFAULT_INITIAL_COUNTER: u32 = 1;
-#[derive(Debug)]
-pub struct Error; // Security guy told me telling attackers why it failed is bad or something idk
 #[rustfmt::skip]
 fn quarter_round(a: u32, b: u32, c: u32, d: u32, state: &mut [u32]) {
     let a = a as usize;
@@ -21,13 +17,12 @@ fn quarter_round(a: u32, b: u32, c: u32, d: u32, state: &mut [u32]) {
     }
 }
 #[rustfmt::skip]
-fn initialize_state(key: Key, nonce: Nonce, counter: u32) -> State {
+fn initialize_state(key: Key, nonce: Nonce, counter: u32) -> Result<State, Error> {
     let mut ikey = Zeroizing::new([0u32; 8]); // Intermediate key representation
     for (i, val) in ikey.iter_mut().enumerate() {
         *val = u32::from_le_bytes(
             key[(i * 4)..(4 + (i * 4))]
-                .try_into()
-                .expect("Something has gone VERY, VERY wrong."),
+                .try_into().map_err(|_| Error::OhGodPleaseNo)?,
         );
     }
     let mut inonce = [0u32; 3]; // Intermediate nonce representation
@@ -35,18 +30,18 @@ fn initialize_state(key: Key, nonce: Nonce, counter: u32) -> State {
         *val = u32::from_le_bytes(
             nonce[(i * 4)..(4 + (i * 4))]
                 .try_into()
-                .expect("Something has gone VERY, VERY wrong."),
+                .map_err(|_| Error::OhGodPleaseNo)?,
         );
     }
-    Zeroizing::new([
+    Ok(Zeroizing::new([
         0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574,
         ikey[0], ikey[1], ikey[2], ikey[3],
         ikey[4], ikey[5], ikey[6], ikey[7],
         counter, inonce[0], inonce[1], inonce[2]
-    ])
+    ]))
 }
-fn inner_block(key: Key, nonce: Nonce, counter: u32) -> State {
-    let mut state = initialize_state(key, nonce, counter);
+fn inner_block(key: Key, nonce: Nonce, counter: u32) -> Result<State, Error> {
+    let mut state = initialize_state(key, nonce, counter)?;
     for _ in 0..10 {
         quarter_round(0, 4, 8, 12, state.as_mut());
         quarter_round(1, 5, 9, 13, state.as_mut());
@@ -57,22 +52,24 @@ fn inner_block(key: Key, nonce: Nonce, counter: u32) -> State {
         quarter_round(2, 7, 8, 13, state.as_mut());
         quarter_round(3, 4, 9, 14, state.as_mut());
     }
-    state
+    Ok(state)
 }
-fn block_adder(key: Key, nonce: Nonce, counter: u32) -> State {
-    let mut state = inner_block(key, nonce, counter);
-    let initial_state = initialize_state(key, nonce, counter);
+fn block_adder(key: Key, nonce: Nonce, counter: u32) -> Result<State, Error> {
+    let mut state = inner_block(key, nonce, counter)?;
+    let initial_state = initialize_state(key, nonce, counter)?;
     for (init, processed) in zip(initial_state.iter(), state.iter_mut()) {
         *processed = processed.wrapping_add(*init);
     }
-    state
+    Ok(state)
 }
-fn block(key: Key, nonce: Nonce, counter: u32) -> Zeroizing<[u8; 64]> {
+/// # Errors
+/// There are none lolol
+pub fn block(key: Key, nonce: Nonce, counter: u32) -> Result<Zeroizing<[u8; 64]>, Error> {
     let mut serialized = Zeroizing::new([0u8; 64]);
-    for (i, val) in block_adder(key, nonce, counter).iter().enumerate() {
+    for (i, val) in block_adder(key, nonce, counter)?.iter().enumerate() {
         serialized[i * 4..i * 4 + 4].copy_from_slice(&val.to_le_bytes());
     }
-    serialized
+    Ok(serialized)
 }
 /// # Errors
 /// Uh sometimes the plaintext is too long
@@ -84,13 +81,13 @@ pub fn chacha20(
 ) -> Result<Vec<u8>, Error> {
     let counter = counter.unwrap_or(DEFAULT_INITIAL_COUNTER);
     if plaintext.len() > u32::MAX as usize {
-        return Err(Error);
+        return Err(Error::CryptoError);
     }
     let mut ciphertext = Vec::with_capacity(plaintext.len());
     for i in 0..(plaintext.len().div_ceil(64) - 1) {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         // Shut the hell up clippy we already validated plaintext length
-        let key_stream = block(key, nonce, counter + i as u32);
+        let key_stream = block(key, nonce, counter + i as u32)?;
         let block = &plaintext[(i * 64)..(i * 64 + 64)];
         for (i, byte) in key_stream.iter().enumerate() {
             ciphertext.push(block[i] ^ *byte);
@@ -100,7 +97,7 @@ pub fn chacha20(
         let whole_block_count = plaintext.len().div_ceil(64) - 1;
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         // Shut the hell up clippy we already validated plaintext length
-        let key_stream = block(key, nonce, counter + whole_block_count as u32);
+        let key_stream = block(key, nonce, counter + whole_block_count as u32)?;
         let block = &plaintext[(whole_block_count * 64)..plaintext.len()];
         for i in 0..plaintext.len() % 64 {
             ciphertext.push(block[i] ^ key_stream[i]);
@@ -131,7 +128,8 @@ mod tests {
                     0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00
                 ],
                 1,
-            ),
+            )
+            .unwrap(),
             [
                 0x10, 0xf1, 0xe7, 0xe4, 0xd1, 0x3b, 0x59, 0x15, 0x50, 0x0f, 0xdd, 0x1f, 0xa3, 0x20,
                 0x71, 0xc4, 0xc7, 0xd1, 0xf4, 0xc7, 0x33, 0xc0, 0x68, 0x03, 0x04, 0x22, 0xaa, 0x9a,
