@@ -80,7 +80,7 @@ pub fn chacha20(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
     let counter = counter.unwrap_or(DEFAULT_INITIAL_COUNTER);
-    if plaintext.len() > u32::MAX as usize {
+    if plaintext.len() / 64 > u32::MAX as usize {
         return Err(Error::CryptoError);
     }
     let mut ciphertext = Vec::with_capacity(plaintext.len());
