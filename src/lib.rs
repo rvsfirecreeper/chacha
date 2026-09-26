@@ -5,9 +5,9 @@ pub use chacha::chacha20;
 use chacha::chacha20_block;
 use poly1305::poly1305;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
-type Key = [u8; 32];
-type Nonce = [u8; 12];
-type State = Zeroizing<[u32; 16]>;
+pub type Key = [u8; 32];
+pub type Nonce = [u8; 12];
+pub type State = Zeroizing<[u32; 16]>;
 #[derive(Debug)]
 pub enum Error {
     CryptoError,   // Apparently your not supposed to tell you what went wrong
