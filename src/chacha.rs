@@ -17,7 +17,7 @@ fn quarter_round(a: u32, b: u32, c: u32, d: u32, state: &mut [u32]) {
     }
 }
 #[rustfmt::skip]
-fn initialize_state(key: Key, nonce: Nonce<12>, counter: u32) -> Result<State, Error> {
+pub fn initialize_state(key: Key, nonce: Nonce<12>, counter: u32) -> Result<State, Error> {
     let mut ikey = Zeroizing::new([0u32; 8]); // Intermediate key representation
     for (i, val) in ikey.iter_mut().enumerate() {
         *val = u32::from_le_bytes(
@@ -40,8 +40,7 @@ fn initialize_state(key: Key, nonce: Nonce<12>, counter: u32) -> Result<State, E
         counter, inonce[0], inonce[1], inonce[2]
     ]))
 }
-fn inner_block(key: Key, nonce: Nonce<12>, counter: u32) -> Result<State, Error> {
-    let mut state = initialize_state(key, nonce, counter)?;
+fn inner_block(state: &mut State) {
     for _ in 0..10 {
         quarter_round(0, 4, 8, 12, state.as_mut());
         quarter_round(1, 5, 9, 13, state.as_mut());
@@ -52,28 +51,23 @@ fn inner_block(key: Key, nonce: Nonce<12>, counter: u32) -> Result<State, Error>
         quarter_round(2, 7, 8, 13, state.as_mut());
         quarter_round(3, 4, 9, 14, state.as_mut());
     }
-    Ok(state)
 }
-fn block_adder(key: Key, nonce: Nonce<12>, counter: u32) -> Result<State, Error> {
-    let mut state = inner_block(key, nonce, counter)?;
-    let initial_state = initialize_state(key, nonce, counter)?;
+fn block_adder(state: &mut State) {
+    let initial_state = state.clone();
+    inner_block(state);
     for (init, processed) in zip(initial_state.iter(), state.iter_mut()) {
         *processed = processed.wrapping_add(*init);
     }
-    Ok(state)
 }
 /// # Errors
 /// There are none lolol
-pub fn chacha20_block(
-    key: Key,
-    nonce: Nonce<12>,
-    counter: u32,
-) -> Result<Zeroizing<[u8; 64]>, Error> {
+pub fn chacha20_block(state: &mut State) -> Zeroizing<[u8; 64]> {
     let mut serialized = Zeroizing::new([0u8; 64]);
-    for (i, val) in block_adder(key, nonce, counter)?.iter().enumerate() {
+    block_adder(state);
+    for (i, val) in state.iter().enumerate() {
         serialized[i * 4..i * 4 + 4].copy_from_slice(&val.to_le_bytes());
     }
-    Ok(serialized)
+    serialized
 }
 /// # Errors
 /// Uh sometimes the plaintext is too long
@@ -84,17 +78,21 @@ pub fn chacha20(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
     let counter = counter.unwrap_or(DEFAULT_INITIAL_COUNTER);
+    let mut starting_state = initialize_state(key, nonce, counter)?;
+    let mut state = starting_state.clone();
     if plaintext.len().div_ceil(64) > (u32::MAX - counter) as usize {
         return Err(Error::CryptoError);
     }
     let mut ciphertext = Vec::with_capacity(plaintext.len());
-    for (i, plaintext_block) in plaintext.chunks(64).enumerate() {
+    for plaintext_block in plaintext.chunks(64) {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         // Shut the hell up clippy we already validated plaintext length
-        let key_stream = chacha20_block(key, nonce, counter + i as u32)?;
+        let key_stream = chacha20_block(&mut state);
         for (byte, key_byte) in plaintext_block.iter().zip(key_stream.iter()) {
             ciphertext.push(byte ^ key_byte);
         }
+        starting_state[12] += 1;
+        state.clone_from(&starting_state);
     }
     Ok(ciphertext)
 }
@@ -110,19 +108,17 @@ mod tests {
     }
     #[test]
     fn block_test() {
+        let key = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let nonce = [
+            0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut state = initialize_state(key, nonce, 1).unwrap();
         assert_eq!(
-            *chacha20_block(
-                [
-                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
-                    0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
-                    0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-                ],
-                [
-                    0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00
-                ],
-                1,
-            )
-            .unwrap(),
+            *chacha20_block(&mut state),
             [
                 0x10, 0xf1, 0xe7, 0xe4, 0xd1, 0x3b, 0x59, 0x15, 0x50, 0x0f, 0xdd, 0x1f, 0xa3, 0x20,
                 0x71, 0xc4, 0xc7, 0xd1, 0xf4, 0xc7, 0x33, 0xc0, 0x68, 0x03, 0x04, 0x22, 0xaa, 0x9a,

@@ -5,6 +5,8 @@ pub use chacha::chacha20;
 use chacha::chacha20_block;
 use poly1305::poly1305;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+use crate::chacha::initialize_state;
 pub type Key = [u8; 32];
 pub type Nonce<const N: usize> = [u8; N];
 pub type State = Zeroizing<[u32; 16]>;
@@ -20,8 +22,9 @@ impl Poly1305Key {
     /// # Errors
     /// It can't unless an Invariant fails
     fn key_gen(key: Key, nonce: Nonce<12>) -> Result<Self, Error> {
+        let mut state = initialize_state(key, nonce, 0)?;
         Ok(Self(
-            chacha20_block(key, nonce, 0)?[0..32]
+            chacha20_block(&mut state)[0..32]
                 .try_into()
                 .map_err(|_| Error::OhGodPleaseNo)?,
         ))
