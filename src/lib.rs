@@ -6,7 +6,7 @@ use chacha::chacha20_block;
 use poly1305::poly1305;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 pub type Key = [u8; 32];
-pub type Nonce = [u8; 12];
+pub type Nonce<const N: usize> = [u8; N];
 pub type State = Zeroizing<[u32; 16]>;
 #[derive(Debug)]
 pub enum Error {
@@ -19,7 +19,7 @@ struct Poly1305Key([u8; 32]);
 impl Poly1305Key {
     /// # Errors
     /// It can't unless an Invariant fails
-    fn key_gen(key: Key, nonce: Nonce) -> Result<Self, Error> {
+    fn key_gen(key: Key, nonce: Nonce<12>) -> Result<Self, Error> {
         Ok(Self(
             chacha20_block(key, nonce, 0)?[0..32]
                 .try_into()
@@ -33,7 +33,7 @@ pub fn chacha20poly1305_encrypt(
     plaintext: &[u8],
     aad: Option<&[u8]>,
     key: Key,
-    nonce: Nonce,
+    nonce: Nonce<12>,
 ) -> Result<Vec<u8>, Error> {
     let aad = aad.unwrap_or(&[]);
     let ciphertext_raw = chacha20(key, nonce, None, plaintext)?;
@@ -48,7 +48,7 @@ pub fn chacha20poly1305_decrypt(
     ciphertext: &[u8],
     aad: Option<&[u8]>,
     key: Key,
-    nonce: Nonce,
+    nonce: Nonce<12>,
 ) -> Result<Vec<u8>, Error> {
     let aad = aad.unwrap_or(&[]);
     let split = ciphertext.len().checked_sub(16).ok_or(Error::CryptoError)?;
@@ -64,7 +64,7 @@ pub fn chacha20poly1305_decrypt(
     }
     chacha20(key, nonce, None, ciphertext_raw)
 }
-fn aead_tag(aad: &[u8], ciphertext: &[u8], key: Key, nonce: Nonce) -> Result<[u8; 16], Error> {
+fn aead_tag(aad: &[u8], ciphertext: &[u8], key: Key, nonce: Nonce<12>) -> Result<[u8; 16], Error> {
     let tag_key = Poly1305Key::key_gen(key, nonce)?;
     let mut msg = Vec::new();
     msg.extend_from_slice(aad);

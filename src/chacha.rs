@@ -17,7 +17,7 @@ fn quarter_round(a: u32, b: u32, c: u32, d: u32, state: &mut [u32]) {
     }
 }
 #[rustfmt::skip]
-fn initialize_state(key: Key, nonce: Nonce, counter: u32) -> Result<State, Error> {
+fn initialize_state(key: Key, nonce: Nonce<12>, counter: u32) -> Result<State, Error> {
     let mut ikey = Zeroizing::new([0u32; 8]); // Intermediate key representation
     for (i, val) in ikey.iter_mut().enumerate() {
         *val = u32::from_le_bytes(
@@ -40,7 +40,7 @@ fn initialize_state(key: Key, nonce: Nonce, counter: u32) -> Result<State, Error
         counter, inonce[0], inonce[1], inonce[2]
     ]))
 }
-fn inner_block(key: Key, nonce: Nonce, counter: u32) -> Result<State, Error> {
+fn inner_block(key: Key, nonce: Nonce<12>, counter: u32) -> Result<State, Error> {
     let mut state = initialize_state(key, nonce, counter)?;
     for _ in 0..10 {
         quarter_round(0, 4, 8, 12, state.as_mut());
@@ -54,7 +54,7 @@ fn inner_block(key: Key, nonce: Nonce, counter: u32) -> Result<State, Error> {
     }
     Ok(state)
 }
-fn block_adder(key: Key, nonce: Nonce, counter: u32) -> Result<State, Error> {
+fn block_adder(key: Key, nonce: Nonce<12>, counter: u32) -> Result<State, Error> {
     let mut state = inner_block(key, nonce, counter)?;
     let initial_state = initialize_state(key, nonce, counter)?;
     for (init, processed) in zip(initial_state.iter(), state.iter_mut()) {
@@ -64,7 +64,11 @@ fn block_adder(key: Key, nonce: Nonce, counter: u32) -> Result<State, Error> {
 }
 /// # Errors
 /// There are none lolol
-pub fn chacha20_block(key: Key, nonce: Nonce, counter: u32) -> Result<Zeroizing<[u8; 64]>, Error> {
+pub fn chacha20_block(
+    key: Key,
+    nonce: Nonce<12>,
+    counter: u32,
+) -> Result<Zeroizing<[u8; 64]>, Error> {
     let mut serialized = Zeroizing::new([0u8; 64]);
     for (i, val) in block_adder(key, nonce, counter)?.iter().enumerate() {
         serialized[i * 4..i * 4 + 4].copy_from_slice(&val.to_le_bytes());
@@ -75,7 +79,7 @@ pub fn chacha20_block(key: Key, nonce: Nonce, counter: u32) -> Result<Zeroizing<
 /// Uh sometimes the plaintext is too long
 pub fn chacha20(
     key: Key,
-    nonce: Nonce,
+    nonce: Nonce<12>,
     counter: Option<u32>,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, Error> {
