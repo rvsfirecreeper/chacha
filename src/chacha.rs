@@ -40,7 +40,7 @@ pub fn initialize_state(key: Key, nonce: Nonce<12>, counter: u32) -> Result<Stat
         counter, inonce[0], inonce[1], inonce[2]
     ]))
 }
-fn inner_block(state: &mut State) {
+pub fn inner_block(state: &mut State) {
     for _ in 0..10 {
         quarter_round(0, 4, 8, 12, state.as_mut());
         quarter_round(1, 5, 9, 13, state.as_mut());
@@ -52,7 +52,7 @@ fn inner_block(state: &mut State) {
         quarter_round(3, 4, 9, 14, state.as_mut());
     }
 }
-fn block_adder(state: &mut State) {
+pub fn block_adder(state: &mut State) {
     let initial_state = state.clone();
     inner_block(state);
     for (init, processed) in zip(initial_state.iter(), state.iter_mut()) {
@@ -116,7 +116,7 @@ mod tests {
         let nonce = [
             0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00,
         ];
-        let mut state = initialize_state(key, nonce, 1).unwrap();
+        let mut state = initialize_state(&key, nonce, 1).unwrap();
         assert_eq!(
             *chacha20_block(&mut state),
             [
@@ -154,7 +154,7 @@ mod tests {
         ];
         assert_eq!(
             chacha20(
-                [
+                &[
                     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
                     0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
                     0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,

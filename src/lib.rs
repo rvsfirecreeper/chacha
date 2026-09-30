@@ -1,16 +1,19 @@
 #![warn(clippy::pedantic)]
 mod chacha;
 mod poly1305;
+mod xchacha;
 pub use chacha::chacha20;
 use chacha::chacha20_block;
 use poly1305::poly1305;
+use xchacha::hchacha20;
+pub use xchacha::xchacha20;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::chacha::initialize_state;
-pub type Key = [u8; 32];
+pub type Key<'a> = &'a [u8; 32];
 pub type Nonce<const N: usize> = [u8; N];
 pub type State = Zeroizing<[u32; 16]>;
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 pub enum Error {
     CryptoError,   // Apparently your not supposed to tell you what went wrong
     OhGodPleaseNo, // Something has gone Terribly wrong and some invariant has failed.
@@ -67,6 +70,39 @@ pub fn chacha20poly1305_decrypt(
     }
     chacha20(key, nonce, None, ciphertext_raw)
 }
+/// # Errors
+/// The plaintext is too long, or the universe is broken(Invariants Failed)
+pub fn xchacha20poly1305_encrypt(
+    plaintext: &[u8],
+    aad: Option<&[u8]>,
+    key: Key,
+    nonce: Nonce<24>,
+) -> Result<Vec<u8>, Error> {
+    // XChaCha20-Poly1305 is just ChaCha20-Poly1305 with the HChaCha20 subkey and derived nonce
+    let subkey = hchacha20(
+        key,
+        nonce[0..16].try_into().map_err(|_| Error::OhGodPleaseNo)?,
+    )?;
+    let mut functionalnonce = [0u8; 12];
+    functionalnonce[4..12].copy_from_slice(&nonce[16..24]);
+    chacha20poly1305_encrypt(plaintext, aad, &subkey, functionalnonce)
+}
+/// # Errors
+/// The ciphertext is too short or fails authentication, or the universe is broken(Invariants Failed)
+pub fn xchacha20poly1305_decrypt(
+    ciphertext: &[u8],
+    aad: Option<&[u8]>,
+    key: Key,
+    nonce: Nonce<24>,
+) -> Result<Vec<u8>, Error> {
+    let subkey = hchacha20(
+        key,
+        nonce[0..16].try_into().map_err(|_| Error::OhGodPleaseNo)?,
+    )?;
+    let mut functionalnonce = [0u8; 12];
+    functionalnonce[4..12].copy_from_slice(&nonce[16..24]);
+    chacha20poly1305_decrypt(ciphertext, aad, &subkey, functionalnonce)
+}
 fn aead_tag(aad: &[u8], ciphertext: &[u8], key: Key, nonce: Nonce<12>) -> Result<[u8; 16], Error> {
     let tag_key = Poly1305Key::key_gen(key, nonce)?;
     let mut msg = Vec::new();
@@ -85,7 +121,7 @@ mod tests {
     #[test]
     fn poly1305_key_gen_test() {
         let key = Poly1305Key::key_gen(
-            [
+            &[
                 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d,
                 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b,
                 0x9c, 0x9d, 0x9e, 0x9f,
@@ -119,7 +155,7 @@ mod tests {
         aad[0..4].copy_from_slice(b"PQRS");
         aad[4..12].copy_from_slice(&[0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7]);
         assert_eq!(
-            chacha20poly1305_encrypt(plaintext, Some(&aad), key, nonce).unwrap(),
+            chacha20poly1305_encrypt(plaintext, Some(&aad), &key, nonce).unwrap(),
             [
                 0xd3, 0x1a, 0x8d, 0x34, 0x64, 0x8e, 0x60, 0xdb, 0x7b, 0x86, 0xaf, 0xbc, 0x53, 0xef,
                 0x7e, 0xc2, 0xa4, 0xad, 0xed, 0x51, 0x29, 0x6e, 0x08, 0xfe, 0xa9, 0xe2, 0xb5, 0xa7,
@@ -135,15 +171,49 @@ mod tests {
         );
     }
     #[test]
+    fn xchacha20poly1305_sunscreen() {
+        // Test vector from draft-irtf-cfrg-xchacha-03 Appendix A.3.1
+        let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        let nonce = *b"@ABCDEFGHIJKLMNOPQRSTUVW";
+        let key = [
+            0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d,
+            0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b,
+            0x9c, 0x9d, 0x9e, 0x9f,
+        ];
+        let mut aad = [0u8; 12];
+        aad[0..4].copy_from_slice(b"PQRS");
+        aad[4..12].copy_from_slice(&[0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7]);
+        let expected = [
+            0xbd, 0x6d, 0x17, 0x9d, 0x3e, 0x83, 0xd4, 0x3b, 0x95, 0x76, 0x57, 0x94, 0x93, 0xc0,
+            0xe9, 0x39, 0x57, 0x2a, 0x17, 0x00, 0x25, 0x2b, 0xfa, 0xcc, 0xbe, 0xd2, 0x90, 0x2c,
+            0x21, 0x39, 0x6c, 0xbb, 0x73, 0x1c, 0x7f, 0x1b, 0x0b, 0x4a, 0xa6, 0x44, 0x0b, 0xf3,
+            0xa8, 0x2f, 0x4e, 0xda, 0x7e, 0x39, 0xae, 0x64, 0xc6, 0x70, 0x8c, 0x54, 0xc2, 0x16,
+            0xcb, 0x96, 0xb7, 0x2e, 0x12, 0x13, 0xb4, 0x52, 0x2f, 0x8c, 0x9b, 0xa4, 0x0d, 0xb5,
+            0xd9, 0x45, 0xb1, 0x1b, 0x69, 0xb9, 0x82, 0xc1, 0xbb, 0x9e, 0x3f, 0x3f, 0xac, 0x2b,
+            0xc3, 0x69, 0x48, 0x8f, 0x76, 0xb2, 0x38, 0x35, 0x65, 0xd3, 0xff, 0xf9, 0x21, 0xf9,
+            0x66, 0x4c, 0x97, 0x63, 0x7d, 0xa9, 0x76, 0x88, 0x12, 0xf6, 0x15, 0xc6, 0x8b, 0x13,
+            0xb5, 0x2e, 0xc0, 0x87, 0x59, 0x24, 0xc1, 0xc7, 0x98, 0x79, 0x47, 0xde, 0xaf, 0xd8,
+            0x78, 0x0a, 0xcf, 0x49,
+        ];
+        assert_eq!(
+            xchacha20poly1305_encrypt(plaintext, Some(&aad), &key, nonce).unwrap(),
+            expected
+        );
+        assert_eq!(
+            xchacha20poly1305_decrypt(&expected, Some(&aad), &key, nonce).unwrap(),
+            plaintext
+        );
+    }
+    #[test]
     fn chacha20poly1305_round_trip() {
         let key = [0x42u8; 32];
         let nonce = [0x24u8; 12];
         let aad = b"some header";
         for len in [0u8, 1, 15, 16, 17, 64, 65, 200] {
             let plaintext: Vec<u8> = (0..len).collect();
-            let ciphertext = chacha20poly1305_encrypt(&plaintext, Some(aad), key, nonce).unwrap();
+            let ciphertext = chacha20poly1305_encrypt(&plaintext, Some(aad), &key, nonce).unwrap();
             assert_eq!(ciphertext.len(), plaintext.len() + 16);
-            let decrypted = chacha20poly1305_decrypt(&ciphertext, Some(aad), key, nonce).unwrap();
+            let decrypted = chacha20poly1305_decrypt(&ciphertext, Some(aad), &key, nonce).unwrap();
             assert_eq!(decrypted, plaintext);
         }
     }
@@ -153,19 +223,19 @@ mod tests {
         let nonce = [0x24u8; 12];
         let aad = b"some header";
         let ciphertext =
-            chacha20poly1305_encrypt(b"attack at dawn", Some(aad), key, nonce).unwrap();
+            chacha20poly1305_encrypt(b"attack at dawn", Some(aad), &key, nonce).unwrap();
         // Flipped bit in the ciphertext body
         let mut tampered = ciphertext.clone();
         tampered[0] ^= 1;
-        assert!(chacha20poly1305_decrypt(&tampered, Some(aad), key, nonce).is_err());
+        assert!(chacha20poly1305_decrypt(&tampered, Some(aad), &key, nonce).is_err());
         // Flipped bit in the tag
         let mut tampered = ciphertext.clone();
         *tampered.last_mut().unwrap() ^= 1;
-        assert!(chacha20poly1305_decrypt(&tampered, Some(aad), key, nonce).is_err());
+        assert!(chacha20poly1305_decrypt(&tampered, Some(aad), &key, nonce).is_err());
         // Wrong or missing AAD
-        assert!(chacha20poly1305_decrypt(&ciphertext, Some(b"other header"), key, nonce).is_err());
-        assert!(chacha20poly1305_decrypt(&ciphertext, None, key, nonce).is_err());
+        assert!(chacha20poly1305_decrypt(&ciphertext, Some(b"other header"), &key, nonce).is_err());
+        assert!(chacha20poly1305_decrypt(&ciphertext, None, &key, nonce).is_err());
         // Too short to even hold a tag
-        assert!(chacha20poly1305_decrypt(&ciphertext[..15], Some(aad), key, nonce).is_err());
+        assert!(chacha20poly1305_decrypt(&ciphertext[..15], Some(aad), &key, nonce).is_err());
     }
 }
